@@ -166,7 +166,7 @@ class Config:
             paths += [['edit']+p[len(context):i] for p in patterns for i in range(len(context)+1,len(p)) if all(a.startswith('<') or a==b for a,b in zip(p,context)) and len(p)>=len(context)]
             paths += [['commit'],['commit','check'],['commit','confirmed','<minutes>'],['rollback','0'],['rollback','1'],['show'],['show','|','compare'],['top'],['up'],['exit'],['exit','discard']]
         else:
-            paths=[['ping','<host>'],['ping','<host>','count','<count>'],['ping','<host>','source','<IPv4>'],['configure'],['show','configuration','|','display','set'],['show','configuration'],['show','interfaces','terse'],['show','vlans'],['show','ethernet-switching','table'],['show','version'],['show','system','commit'],['exit']]
+            paths=[['request','lab','start'],['request','lab','stop'],['request','lab','host','<port>','address','<IPv4/prefix>'],['request','lab','ping','<port>','<IPv4>'],['ping','<host>'],['ping','<host>','count','<count>'],['ping','<host>','source','<IPv4>'],['configure'],['show','configuration','|','display','set'],['show','configuration'],['show','interfaces','terse'],['show','vlans'],['show','ethernet-switching','table'],['show','version'],['show','system','commit'],['exit']]
         choices=set()
         for p in paths:
             if len(words)>=len(p): continue
@@ -222,6 +222,66 @@ class Backend:
             run('usermod','-L',user)
             run('usermod','-s','/usr/sbin/nologin',user)
         run('systemctl','start' if c['ssh'] else 'stop','ssh')
+
+class LabBackend(Backend):
+    """Session-owned Linux namespace with a VLAN-aware bridge and endpoint hosts."""
+    def __init__(self,ports):
+        super().__init__(ports,True)
+        import uuid
+        self.namespace='nullos-'+uuid.uuid4().hex[:12]
+        self.owned=[];self.hosts={}
+    def ns(self,name,*args):return run('ip','netns','exec',name,*args)
+    def create_ns(self,name):
+        run('ip','netns','add',name);self.owned.append(name)
+        self.ns(name,'ip','link','set','lo','up')
+    def start(self):
+        if os.geteuid()!=0:raise ValueError('temporary backend needs Linux root privileges: launch with sudo and --demo')
+        try:
+            self.create_ns(self.namespace)
+            self.ns(self.namespace,'ip','link','add','br0','type','bridge','vlan_filtering','1','vlan_default_pvid','0')
+            self.ns(self.namespace,'ip','link','set','br0','up')
+            for i,logical in enumerate(self.ports):
+                host=self.namespace+'-h'+str(i);self.create_ns(host);self.hosts[logical]=host
+                port='p'+str(i)
+                self.ns(self.namespace,'ip','link','add',port,'type','veth','peer','name','eth0','netns',host)
+                self.ns(self.namespace,'ip','link','set',port,'master','br0')
+                self.ns(host,'ip','link','set','eth0','up')
+        except Exception:
+            self.stop();raise
+    def stop(self):
+        errors=[]
+        for name in list(reversed(self.owned)):
+            try:run('ip','netns','del',name);self.owned.remove(name)
+            except Exception as e:errors.append(str(e))
+        if errors:raise ValueError('cleanup incomplete: '+'; '.join(errors))
+    def apply(self,c,old):
+        ns=self.namespace
+        # Only isolated switch state is applied; system accounts and SSH remain simulated.
+        for i,logical in enumerate(self.ports):
+            port='p'+str(i);p=c['ports'].get(logical)
+            self.ns(ns,'ip','link','set',port,'down')
+            self.ns(ns,'bridge','vlan','del','dev',port,'vid','1-4094')
+            if p and not p['disabled']:
+                for member in p['members']:
+                    args=['bridge','vlan','add','dev',port,'vid',str(c['vlans'][member]['id'])]
+                    if p['mode']=='access':args+=['pvid','untagged']
+                    self.ns(ns,*args)
+                self.ns(ns,'ip','link','set',port,'up')
+        links=json.loads(self.ns(ns,'ip','-j','link','show'))
+        if any(x['ifname']=='mgmt0' for x in links):self.ns(ns,'ip','link','del','mgmt0')
+        self.ns(ns,'bridge','vlan','del','dev','br0','vid','1-4094','self')
+        vid=next((v['id'] for v in c['vlans'].values() if v.get('irb')),None)
+        if vid:
+            self.ns(ns,'bridge','vlan','add','dev','br0','vid',str(vid),'self')
+            self.ns(ns,'ip','link','add','link','br0','name','mgmt0','type','vlan','id',str(vid))
+            self.ns(ns,'ip','link','set','mgmt0','up')
+            for addr in c['addresses']:self.ns(ns,'ip','addr','add',addr,'dev','mgmt0')
+            if c['gateway']:self.ns(ns,'ip','route','replace','default','via',c['gateway'],'dev','mgmt0')
+    def address(self,port,address):
+        if port not in self.hosts:raise ValueError('unknown port')
+        addr=ipaddress.IPv4Interface(address)
+        self.ns(self.hosts[port],'ip','-4','addr','flush','dev','eth0')
+        self.ns(self.hosts[port],'ip','addr','add',str(addr),'dev','eth0')
 
 class Store:
     def __init__(self,path,ports,demo=False):
@@ -287,6 +347,27 @@ class CLI:
         t=shlex.split(line)
         if not t:return
         if not self.editing:
+            if t[:2]==['request','lab']:
+                if not self.store.backend.demo:raise ValueError('lab commands require demo mode')
+                lab=self.store.backend
+                if t==['request','lab','start']:
+                    if isinstance(lab,LabBackend):raise ValueError('lab already running')
+                    if self.store.load()['pending']:raise ValueError('confirm or roll back pending commit first')
+                    new=LabBackend(lab.ports);new.start()
+                    try:new.apply(self.store.cfg.validate(self.store.load()['active']),{})
+                    except Exception:new.stop();raise
+                    self.store.backend=new
+                    print('Temporary isolated backend started: '+new.namespace);return
+                if not isinstance(lab,LabBackend):raise ValueError('start the lab first')
+                if t==['request','lab','stop']:
+                    lab.stop();self.store.backend=Backend(lab.ports,True);print('Temporary backend removed');return
+                if len(t)==6 and t[2]=='host' and t[4]=='address':
+                    lab.address(t[3],t[5]);print('Host address configured');return
+                if len(t)==5 and t[2]=='ping':
+                    if t[3] not in lab.hosts:raise ValueError('unknown port')
+                    target=str(ipaddress.IPv4Address(t[4]))
+                    subprocess.run(['ip','netns','exec',lab.hosts[t[3]],'ping','-4','-n','-c','4','-W','2',target],check=False);return
+                raise ValueError('unsupported lab command')
             if t==['configure']:
                 s=self.store.load();self.candidate=copy.deepcopy(s['active']);self.revision=s['revision'];self.editing=True;return
             if t==['exit']:raise EOFError
@@ -304,12 +385,13 @@ class CLI:
                         if not 1<=count<=100: raise ValueError('count must be 1-100')
                     elif key=='source': source=str(ipaddress.IPv4Address(value))
                     else: raise ValueError('unsupported ping option: '+key)
-                if self.store.backend.demo:
+                if self.store.backend.demo and not isinstance(self.store.backend,LabBackend):
                     print('Demo mode: ping requires the installed networking backend'); return
                 command=['ping','-4','-n','-c',str(count),'-W','2']
                 if source: command+=['-I',source]
                 # No shell; stream replies and preserve normal nonzero unreachable status.
-                subprocess.run(command+['--',t[1]],check=False)
+                prefix=['ip','netns','exec',self.store.backend.namespace] if isinstance(self.store.backend,LabBackend) else []
+                subprocess.run(prefix+command+['--',t[1]],check=False)
                 return
             if t in (['show','configuration'],['show','configuration','|','display','set']): print('\n'.join(display(self.store.load()['active'])));return
             if t==['show','system','commit']:
@@ -358,6 +440,7 @@ class CLI:
             minutes=None
             if t!=['commit']:
                 if len(t)>3:raise ValueError('usage: commit confirmed [minutes]')
+                if isinstance(self.store.backend,LabBackend):raise ValueError('confirmed commits are not supported with a temporary lab; use commit')
                 minutes=int(t[2]) if len(t)==3 else 10
                 if not 1<=minutes<=60:raise ValueError('confirmation timeout must be 1-60 minutes')
             s=self.store.commit(self.candidate,self.revision,minutes);self.revision=s['revision']
@@ -407,5 +490,8 @@ def main():
             try:store.recover()
             except Exception as e:print('recovery error:',e,flush=True)
             time.sleep(1)
-    else:CLI(store).loop()
+    else:
+        try:CLI(store).loop()
+        finally:
+            if isinstance(store.backend,LabBackend):store.backend.stop()
 if __name__=='__main__':main()

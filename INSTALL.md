@@ -83,3 +83,8 @@ python3 -m unittest discover -s tests -v
 
 Additional installation methods are planned. The current ISO recipe is unverified;
 use the clone workflow above first.
+
+## Temporary networking inside demo mode
+
+See [docs/TEMPORARY-LAB.md](docs/TEMPORARY-LAB.md) for setup, real endpoint ping,
+VLAN tests, privileges, and cleanup. It is isolated and has no Internet uplink.

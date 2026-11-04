@@ -165,3 +165,15 @@ additional switching feature against real forwarding tests. Additional features 
 
 Launch with `python3 src/nullos.py --demo --ports 48` to create 48 configuration-only
 ports. Use any positive count. Inventory persists per state directory. See INSTALL.md.
+
+## Temporary network backend (demo only, Linux root required)
+
+| Command | Purpose |
+|---|---|
+| `request lab start` | Creates isolated software switching and one endpoint per port. |
+| `request lab host <port> address <IPv4/prefix>` | Assigns an untagged endpoint address. |
+| `request lab ping <port> <IPv4>` | Sends four probes from that endpoint. |
+| `request lab stop` | Removes the temporary network; retains saved configuration. |
+
+See [the temporary lab walkthrough](docs/TEMPORARY-LAB.md). No Internet uplink
+is created. Ordinary ping uses the isolated switch when the lab is running.
